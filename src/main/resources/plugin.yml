@@ -8,3 +8,7 @@ commands:
     description: 'npcskin'
     usage: '/npcskin'
     permission: op
+
+  restoreskin:
+    description: restore skins for Citiznes npc
+    usage: /restoreskin

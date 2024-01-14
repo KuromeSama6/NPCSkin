@@ -1,11 +1,20 @@
 package org.yirankuma.npcskin;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
 import com.neteasemc.spigotmaster.SpigotMaster;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
-import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import lombok.Getter;
+import net.citizensnpcs.api.CitizensAPI;
+import net.citizensnpcs.api.npc.NPC;
+import net.citizensnpcs.trait.SkinTrait;
+import net.citizensnpcs.util.MojangSkinGenerator;
+import org.bukkit.Bukkit;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.HumanEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.Listener;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -13,7 +22,6 @@ import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
 import org.cloudburstmc.protocol.bedrock.codec.v503.Bedrock_v503;
 import org.cloudburstmc.protocol.bedrock.data.skin.ImageData;
 import org.cloudburstmc.protocol.bedrock.data.skin.SerializedSkin;
-import org.cloudburstmc.protocol.bedrock.packet.AddPlayerPacket;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket;
 import org.cloudburstmc.protocol.bedrock.packet.PlayerListPacket;
 
@@ -21,22 +29,26 @@ import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.MalformedURLException;
+import java.net.URI;
+import java.net.URL;
+import java.nio.file.CopyOption;
 import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Objects;
-import java.util.UUID;
+import java.nio.file.StandardCopyOption;
+import java.util.*;
 
 public final class NPCSkin extends JavaPlugin implements Listener {
-
-    public static NPCSkin plugin;
+    @Getter
+    private static NPCSkin instance;
+    private final Map<NPC, ImageData> skinCache = new HashMap<>();
 
     public SpigotMaster spigotMaster;
 
     @Override
     public void onEnable() {
         spigotMaster = (SpigotMaster) getServer().getPluginManager().getPlugin("SpigotMaster");
-        plugin = this;
+        instance = this;
 
         getServer().getPluginManager().registerEvents(this, this);
         // Plugin startup logic
@@ -66,6 +78,10 @@ public final class NPCSkin extends JavaPlugin implements Listener {
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (label.equalsIgnoreCase("restoreskin") && sender instanceof Player) {
+            RestoreSkins((Player) sender);
+        }
+
         if (Objects.equals(label, "npcskin")) {
             if (sender instanceof Player) {
 
@@ -85,6 +101,7 @@ public final class NPCSkin extends JavaPlugin implements Listener {
                     try {
                         skinImage = ImageIO.read(skinFile);
                         skinData = ImageData.from(skinImage);
+
                         geometryData = new String(Files.readAllBytes(geometryFile.toPath()));
                         skinResourcePatchData = new String(Files.readAllBytes(skinResourcePatch.toPath()));
 
@@ -129,13 +146,119 @@ public final class NPCSkin extends JavaPlugin implements Listener {
 
                     playerListPacket.getEntries().add(entry);
                 }
-                System.out.println(playerListPacket.getEntries());
+//                System.out.println(playerListPacket.getEntries());
                 int packetId = Bedrock_v503.CODEC.getPacketDefinition(playerListPacket.getClass()).getId();
                 spigotMaster.sendBedrockPacket(packetId, encodeBedrockPacket(Bedrock_v503.CODEC, playerListPacket).getData());
                 return true;
             }
         }
         return super.onCommand(sender, command, label, args);
+    }
+
+    public void RestoreSkins(Player player) {
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            for (NPC npc : CitizensAPI.getNPCRegistry()) {
+                SkinTrait skinTrait = npc.getTraitNullable(SkinTrait.class);
+                if (skinTrait == null) continue;
+                String tex = skinTrait.getTexture();
+                if (tex == null) continue;
+
+                ImageData skin;
+                if (skinCache.containsKey(npc)) skin = skinCache.get(npc);
+                else try {
+                    skin = DownloadSkin(tex);
+                    skinCache.put(npc, skin);
+                } catch (IOException e) {
+                    getLogger().severe(String.format("An error occured whilst downloading the skin for npc %s:", npc.getName()));
+                    e.printStackTrace();
+                    return;
+                }
+
+                SendSkinPacket(npc.getEntity(), skin);
+            }
+        });
+    }
+
+    public static String GetSkinDownloadUrl(String tex) {
+        if (tex == null) return null;
+
+        // decode
+        String jsonStr = new String(Base64.getDecoder().decode(tex));
+        JsonObject data = new Gson().fromJson(jsonStr, JsonObject.class);
+
+        return data
+                .get("textures").getAsJsonObject()
+                .get("SKIN").getAsJsonObject()
+                .get("url").getAsString();
+    }
+
+    /**
+     * BLOCKING. Downloads a skin from the texture string of a player's skin data.
+     * @param tex texture string.
+     * @return The downloaded skin in nukkit's ImageData form.
+     */
+    public ImageData DownloadSkin(String tex) throws IOException {
+        URL url = new URL(GetSkinDownloadUrl(tex));
+        BufferedImage skinImage = ImageIO.read(url);
+        return ImageData.from(skinImage);
+    }
+
+    public void SendSkinPacket(Entity entity, ImageData skinData) {
+        PlayerListPacket playerListPacket = new PlayerListPacket();
+        playerListPacket.setAction(PlayerListPacket.Action.ADD);
+
+        File geometryFile = new File(getDataFolder(), "skins/test/geometry.json");
+        File skinResourcePatch = new File(getDataFolder(), "skins/test/skinResourcePatch.json");
+
+        String geometryData = "";
+        String skinResourcePatchData = "";
+        try {
+            geometryData = new String(Files.readAllBytes(geometryFile.toPath()));
+            skinResourcePatchData = new String(Files.readAllBytes(skinResourcePatch.toPath()));
+
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        PlayerListPacket.Entry entry = new PlayerListPacket.Entry(entity.getUniqueId());
+
+        SerializedSkin.Builder builder = SerializedSkin.builder();
+        builder.skinId(UUID.randomUUID().toString());
+        builder.persona(true);
+        builder.fullSkinId("");
+        builder.skinColor("");
+        builder.skinResourcePatch(skinResourcePatchData);
+        builder.animationData("");
+        builder.animations(new ArrayList<>());
+        builder.armSize("wide");
+        builder.capeData(skinData);
+        builder.capeOnClassic(false);
+        builder.personaPieces(new ArrayList<>());
+        builder.capeId("");
+        builder.playFabId("");
+        builder.tintColors(new ArrayList<>());
+        builder.geometryData(geometryData);
+        builder.skinData(skinData);
+        builder.premium(false);
+        builder.geometryDataEngineVersion("");
+
+        SerializedSkin skin = builder.build();
+        entry.setSkin(skin);
+        entry.setEntityId(entity.getEntityId());
+
+        if (entry.getName() == null) {
+            entry.setName(entity.getName());
+        }
+        if (entry.getXuid() == null) {
+            entry.setXuid("");
+        }
+        if (entry.getPlatformChatId() == null) {
+            entry.setPlatformChatId("");
+        }
+
+        playerListPacket.getEntries().add(entry);
+//                System.out.println(playerListPacket.getEntries());
+        int packetId = Bedrock_v503.CODEC.getPacketDefinition(playerListPacket.getClass()).getId();
+        spigotMaster.sendBedrockPacket(packetId, encodeBedrockPacket(Bedrock_v503.CODEC, playerListPacket).getData());
     }
 
     private static final ThreadLocal<ByteBuf> BYTE_BUF_THREAD_LOCAL = ThreadLocal.withInitial(() -> ByteBufAllocator.DEFAULT.heapBuffer(2024));
